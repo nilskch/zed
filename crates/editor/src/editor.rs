@@ -86,6 +86,7 @@ use code_context_menus::{
     CompletionsMenu, ContextMenuOrigin,
 };
 use git::blame::{GitBlame, GlobalBlameRenderer};
+use crate::git::GitMultiBufferBlame;
 use gpui::{
     Action, Animation, AnimationExt, AnyElement, App, AppContext, AsyncWindowContext,
     AvailableSpace, Background, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context,
@@ -1049,6 +1050,7 @@ pub struct Editor {
     serialize_dirty_buffers: bool,
     show_selection_menu: Option<bool>,
     blame: Option<Entity<GitBlame>>,
+    multibuffer_blame: Option<Entity<GitMultiBufferBlame>>,
     blame_subscription: Option<Subscription>,
     custom_context_menu: Option<
         Box<
@@ -1922,6 +1924,7 @@ impl Editor {
                     .session
                     .restore_unsaved_buffers,
             blame: None,
+            multibuffer_blame: None,
             blame_subscription: None,
             tasks: BTreeMap::default(),
 
@@ -2365,6 +2368,10 @@ impl Editor {
                 if let Some(blame) = self.blame.as_ref() {
                     let max_author_length =
                         blame.update(cx, |blame, cx| blame.max_author_length(cx));
+                    Some(max_author_length)
+                } else if let Some(multibuffer_blame) = self.multibuffer_blame.as_ref() {
+                    let max_author_length =
+                        multibuffer_blame.update(cx, |blame, _cx| blame.max_author_length(None));
                     Some(max_author_length)
                 } else {
                     None
@@ -17435,26 +17442,42 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<()> {
-        let blame = self.blame.as_ref()?;
         let snapshot = self.snapshot(window, cx);
         let cursor = self.selections.newest::<Point>(cx).head();
         let (buffer, point, _) = snapshot.buffer_snapshot.point_to_buffer_point(cursor)?;
-        let blame_entry = blame
-            .update(cx, |blame, cx| {
-                blame
-                    .blame_for_rows(
-                        &[RowInfo {
-                            buffer_id: Some(buffer.remote_id()),
-                            buffer_row: Some(point.row),
-                            ..Default::default()
-                        }],
-                        cx,
-                    )
-                    .next()
-            })
-            .flatten()?;
+        let buffer_id = buffer.remote_id();
+        
+        let (blame_entry, repo) = if let Some(multibuffer_blame) = self.multibuffer_blame.as_ref() {
+            let blame_entry = multibuffer_blame
+                .update(cx, |blame, _cx| {
+                    blame.blame_for_rows(buffer_id, point.row..(point.row + 1))
+                        .into_iter()
+                        .next()
+                })
+                .flatten()?;
+            let repo = multibuffer_blame.read(cx).repository(buffer_id, cx)?;
+            (blame_entry, repo)
+        } else {
+            let blame = self.blame.as_ref()?;
+            let blame_entry = blame
+                .update(cx, |blame, cx| {
+                    blame
+                        .blame_for_rows(
+                            &[RowInfo {
+                                buffer_id: Some(buffer_id),
+                                buffer_row: Some(point.row),
+                                ..Default::default()
+                            }],
+                            cx,
+                        )
+                        .next()
+                })
+                .flatten()?;
+            let repo = blame.read(cx).repository(cx)?;
+            (blame_entry, repo)
+        };
+
         let renderer = cx.global::<GlobalBlameRenderer>().0.clone();
-        let repo = blame.read(cx).repository(cx)?;
         let workspace = self.workspace()?.downgrade();
         renderer.open_blame_commit(blame_entry, repo, workspace, window, cx);
         None
@@ -17490,21 +17513,27 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         if let Some(project) = self.project.as_ref() {
-            let Some(buffer) = self.buffer().read(cx).as_singleton() else {
-                return;
-            };
-
-            if buffer.read(cx).file().is_none() {
-                return;
-            }
-
+            let multibuffer = self.buffer().clone();
             let focused = self.focus_handle(cx).contains_focused(window, cx);
-
             let project = project.clone();
-            let blame = cx.new(|cx| GitBlame::new(buffer, project, user_triggered, focused, cx));
-            self.blame_subscription =
-                Some(cx.observe_in(&blame, window, |_, _, _, cx| cx.notify()));
-            self.blame = Some(blame);
+
+            // Check if this is a singleton buffer (single file)
+            if let Some(buffer) = multibuffer.read(cx).as_singleton() {
+                if buffer.read(cx).file().is_none() {
+                    return;
+                }
+
+                let blame = cx.new(|cx| GitBlame::new(buffer, project, user_triggered, focused, cx));
+                self.blame_subscription =
+                    Some(cx.observe_in(&blame, window, |_, _, _, cx| cx.notify()));
+                self.blame = Some(blame);
+            } else {
+                // This is a multibuffer, use the multibuffer blame implementation
+                let multibuffer_blame = cx.new(|cx| GitMultiBufferBlame::new(multibuffer, project, user_triggered, focused, cx));
+                self.blame_subscription =
+                    Some(cx.observe_in(&multibuffer_blame, window, |_, _, _, cx| cx.notify()));
+                self.multibuffer_blame = Some(multibuffer_blame);
+            }
         }
     }
 
@@ -17567,6 +17596,9 @@ impl Editor {
     fn has_blame_entries(&self, cx: &App) -> bool {
         self.blame()
             .map_or(false, |blame| blame.read(cx).has_generated_entries())
+            || self.multibuffer_blame
+                .as_ref()
+                .map_or(false, |blame| blame.read(cx).has_generated_entries(None))
     }
 
     fn newest_selection_head_on_empty_line(&self, cx: &App) -> bool {
@@ -19231,6 +19263,9 @@ impl Editor {
             if let Some(blame) = self.blame.as_ref() {
                 blame.update(cx, GitBlame::focus)
             }
+            if let Some(multibuffer_blame) = self.multibuffer_blame.as_ref() {
+                multibuffer_blame.update(cx, |blame, cx| blame.focus(cx))
+            }
 
             self.blink_manager.update(cx, BlinkManager::enable);
             self.show_cursor_names(window, cx);
@@ -19271,6 +19306,9 @@ impl Editor {
 
         if let Some(blame) = self.blame.as_ref() {
             blame.update(cx, GitBlame::blur)
+        }
+        if let Some(multibuffer_blame) = self.multibuffer_blame.as_ref() {
+            multibuffer_blame.update(cx, |blame, _cx| blame.blur())
         }
         if !self.hover_state.focused(window, cx) {
             hide_hover(self, cx);

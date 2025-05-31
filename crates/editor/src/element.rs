@@ -2150,11 +2150,25 @@ impl EditorElement {
             padding * em_width
         };
 
-        let blame_entry = blame
-            .update(cx, |blame, cx| {
-                blame.blame_for_rows(&[*row_info], cx).next()
-            })
-            .flatten()?;
+        let blame_entry = if let Some(buffer_id) = row_info.buffer_id {
+            if let Some(multibuffer_blame) = self.editor.read(cx).multibuffer_blame.clone() {
+                multibuffer_blame
+                    .update(cx, |blame, _cx| {
+                        blame.blame_for_rows(buffer_id, row_info.buffer_row? as u32..(row_info.buffer_row? as u32 + 1))
+                            .into_iter()
+                            .next()
+                    })
+                    .flatten()?
+            } else {
+                blame
+                    .update(cx, |blame, cx| {
+                        blame.blame_for_rows(&[*row_info], cx).next()
+                    })
+                    .flatten()?
+            }
+        } else {
+            return None;
+        };
 
         let mut element = render_inline_blame_entry(blame_entry.clone(), &self.style, cx)?;
 
@@ -2316,11 +2330,31 @@ impl EditorElement {
             return None;
         }
 
-        let blame = self.editor.read(cx).blame.clone()?;
         let workspace = self.editor.read(cx).workspace()?;
-        let blamed_rows: Vec<_> = blame.update(cx, |blame, cx| {
-            blame.blame_for_rows(buffer_rows, cx).collect()
-        });
+        let buffer_rows_vec: Vec<_> = buffer_rows.into_iter().cloned().collect();
+        let blamed_rows: Vec<_> = if let Some(multibuffer_blame) = self.editor.read(cx).multibuffer_blame.clone() {
+            // For multibuffer, we need to get blame for each row based on its buffer_id
+            let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
+            buffer_rows_vec
+                .iter()
+                .map(|row| {
+                    let row_info = snapshot.row_infos(row.multibuffer_row?).next()?;
+                    let buffer_id = row_info.buffer_id?;
+                    let buffer_row = row_info.buffer_row? as u32;
+                    multibuffer_blame.update(cx, |blame, _cx| {
+                        blame.blame_for_rows(buffer_id, buffer_row..(buffer_row + 1))
+                            .into_iter()
+                            .next()
+                    })
+                    .flatten()
+                })
+                .collect()
+        } else {
+            let blame = self.editor.read(cx).blame.clone()?;
+            blame.update(cx, |blame, cx| {
+                blame.blame_for_rows(&buffer_rows_vec, cx).collect()
+            })
+        };
 
         let width = if let Some(max_width) = max_width {
             AvailableSpace::Definite(max_width)
@@ -2337,17 +2371,38 @@ impl EditorElement {
             .into_iter()
             .enumerate()
             .flat_map(|(ix, blame_entry)| {
-                let mut element = render_blame_entry(
-                    ix,
-                    &blame,
-                    blame_entry?,
-                    &self.style,
-                    &mut last_used_color,
-                    self.editor.clone(),
-                    workspace.clone(),
-                    blame_renderer.clone(),
-                    cx,
-                )?;
+                let blame_entry = blame_entry?;
+                let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
+                let row_info = snapshot.row_infos(buffer_rows_vec[ix].multibuffer_row?).next()?;
+                let buffer_id = row_info.buffer_id?;
+                
+                let mut element = if let Some(multibuffer_blame) = self.editor.read(cx).multibuffer_blame.clone() {
+                    render_multibuffer_blame_entry(
+                        ix,
+                        &multibuffer_blame,
+                        buffer_id,
+                        blame_entry,
+                        &self.style,
+                        &mut last_used_color,
+                        self.editor.clone(),
+                        workspace.clone(),
+                        blame_renderer.clone(),
+                        cx,
+                    )
+                } else {
+                    let blame = self.editor.read(cx).blame.clone()?;
+                    render_blame_entry(
+                        ix,
+                        &blame,
+                        blame_entry,
+                        &self.style,
+                        &mut last_used_color,
+                        self.editor.clone(),
+                        workspace.clone(),
+                        blame_renderer.clone(),
+                        cx,
+                    )
+                }?;
 
                 let start_y = ix as f32 * line_height - (scroll_top % line_height);
                 let absolute_offset = gutter_hitbox.origin + point(start_x, start_y);
@@ -6808,6 +6863,50 @@ fn render_blame_entry(
     )
 }
 
+fn render_multibuffer_blame_entry(
+    ix: usize,
+    multibuffer_blame: &Entity<crate::git::GitMultiBufferBlame>,
+    buffer_id: text::BufferId,
+    blame_entry: BlameEntry,
+    style: &EditorStyle,
+    last_used_color: &mut Option<(PlayerColor, Oid)>,
+    editor: Entity<Editor>,
+    workspace: Entity<Workspace>,
+    renderer: Arc<dyn BlameRenderer>,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    let mut sha_color = cx
+        .theme()
+        .players()
+        .color_for_participant(blame_entry.sha.into());
+
+    // If the last color we used is the same as the one we get for this line, but
+    // the commit SHAs are different, then we try again to get a different color.
+    match *last_used_color {
+        Some((color, sha)) if sha != blame_entry.sha && color.cursor == sha_color.cursor => {
+            let index: u32 = blame_entry.sha.into();
+            sha_color = cx.theme().players().color_for_participant(index + 1);
+        }
+        _ => {}
+    };
+    last_used_color.replace((sha_color, blame_entry.sha));
+
+    let multibuffer_blame = multibuffer_blame.read(cx);
+    let details = multibuffer_blame.details_for_entry(buffer_id, &blame_entry);
+    let repository = multibuffer_blame.repository(buffer_id, cx)?;
+    renderer.render_blame_entry(
+        &style.text,
+        blame_entry,
+        details,
+        repository,
+        workspace.downgrade(),
+        editor,
+        ix,
+        sha_color.cursor,
+        cx,
+    )
+}
+
 #[derive(Debug)]
 pub(crate) struct LineWithInvisibles {
     fragments: SmallVec<[LineFragment; 1]>,
@@ -8012,14 +8111,29 @@ impl Element for EditorElement {
                             if !editor.show_git_blame_inline {
                                 return None;
                             }
-                            let blame = editor.blame.as_ref()?;
-                            let blame_entry = blame
-                                .update(cx, |blame, cx| {
-                                    let row_infos =
-                                        snapshot.row_infos(snapshot.longest_row()).next()?;
-                                    blame.blame_for_rows(&[row_infos], cx).next()
-                                })
-                                .flatten()?;
+                            
+                            let blame_entry = if let Some(multibuffer_blame) = editor.multibuffer_blame.as_ref() {
+                                let row_infos = snapshot.row_infos(snapshot.longest_row()).next()?;
+                                let buffer_id = row_infos.buffer_id?;
+                                let buffer_row = row_infos.buffer_row? as u32;
+                                multibuffer_blame
+                                    .update(cx, |blame, _cx| {
+                                        blame.blame_for_rows(buffer_id, buffer_row..(buffer_row + 1))
+                                            .into_iter()
+                                            .next()
+                                    })
+                                    .flatten()?
+                            } else {
+                                let blame = editor.blame.as_ref()?;
+                                blame
+                                    .update(cx, |blame, cx| {
+                                        let row_infos =
+                                            snapshot.row_infos(snapshot.longest_row()).next()?;
+                                        blame.blame_for_rows(&[row_infos], cx).next()
+                                    })
+                                    .flatten()?
+                            };
+                            
                             let mut element = render_inline_blame_entry(blame_entry, &style, cx)?;
                             let inline_blame_padding = INLINE_BLAME_PADDING_EM_WIDTHS * em_advance;
                             Some(
