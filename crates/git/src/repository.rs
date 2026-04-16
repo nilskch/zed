@@ -54,6 +54,9 @@ static GRAPH_COMMIT_FORMAT: &str = "--format=%H%x00%P%x00%D";
 /// %H - Full commit hash
 static SEARCH_COMMIT_FORMAT: &str = "--format=%H";
 
+static EXCLUDE_JJ_REFS: &str = "--exclude=refs/jj/*";
+static EXCLUDE_JJ_DECORATIONS: &str = "--decorate-refs-exclude=refs/jj/";
+
 /// Number of commits to load per chunk for the git graph.
 pub const GRAPH_CHUNK_SIZE: usize = 1000;
 
@@ -2960,6 +2963,8 @@ impl GitRepository for RealGitRepository {
                 "log",
                 GRAPH_COMMIT_FORMAT,
                 log_order.as_arg(),
+                EXCLUDE_JJ_REFS,
+                EXCLUDE_JJ_DECORATIONS,
                 log_source.get_arg()?,
             ]);
             command.stdout(Stdio::piped());
@@ -3032,7 +3037,13 @@ impl GitRepository for RealGitRepository {
         async move {
             let git = git_binary?;
 
-            let mut args = vec!["log", SEARCH_COMMIT_FORMAT, log_source.get_arg()?];
+            let mut args = vec![
+                "log",
+                SEARCH_COMMIT_FORMAT,
+                EXCLUDE_JJ_REFS,
+                EXCLUDE_JJ_DECORATIONS,
+                log_source.get_arg()?,
+            ];
 
             args.push("--fixed-strings");
 
